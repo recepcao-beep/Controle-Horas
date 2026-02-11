@@ -9,6 +9,12 @@ export const timeToDecimal = (time: string): number => {
   return hours + minutes / 60;
 };
 
+export const formatDecimalHours = (decimal: number): string => {
+  const hours = Math.floor(decimal);
+  const minutes = Math.round((decimal - hours) * 60);
+  return `${hours}h ${minutes.toString().padStart(2, '0')}m`;
+};
+
 export const calculateTimeDiff = (real: string, punch: string): number => {
   return Math.abs(timeToDecimal(real) - timeToDecimal(punch));
 };

@@ -12,6 +12,8 @@ import {
   XCircle, 
   LogOut, 
   ChevronRight, 
+  ChevronDown,
+  ChevronUp,
   Edit2, 
   Database, 
   RefreshCw, 
@@ -44,7 +46,8 @@ import {
 } from './types';
 import { 
   formatCurrency, 
-  calculateTimeDiff, 
+  timeToDecimal,
+  formatDecimalHours,
   getWeekDays 
 } from './utils';
 
@@ -115,23 +118,25 @@ const App: React.FC = () => {
     setIsSyncing(true);
     
     // Preparação de dados FLAT para o Sheets (Célula por Célula)
-    // Criamos um array onde cada objeto é uma "linha" de dia trabalhado
+    // Transforma a estrutura hierárquica em linhas planas para a planilha
     const flattenedRequests = currentData.requests.flatMap(req => 
       req.records.map(rec => ({
-        requestId: req.id,
-        employeeName: req.employeeName,
-        type: req.employeeType,
-        sector: req.sectorName,
-        weekStarting: req.weekStarting,
+        id_solicitacao: req.id,
+        funcionario: req.employeeName,
+        tipo: req.employeeType,
+        setor: req.sectorName,
+        data_semana: req.weekStarting,
         status: req.status,
-        calculatedTotal: req.calculatedValue,
-        date: rec.date,
-        realEntry: rec.realEntry,
-        punchEntry: rec.punchEntry,
-        punchExit: rec.punchExit,
-        realExit: rec.realExit,
-        isFolgaVendida: rec.isFolgaVendida ? "SIM" : "NÃO",
-        createdAt: req.createdAt
+        valor_total_pedido: req.calculatedValue,
+        // Dados do Registro Diário
+        data_registro: rec.date,
+        entrada_real: rec.realEntry,
+        entrada_ponto: rec.punchEntry,
+        saida_ponto: rec.punchExit,
+        saida_real: rec.realExit,
+        folga_vendida: rec.isFolgaVendida ? "SIM" : "NÃO",
+        criado_em: req.createdAt,
+        justificativa_edicao: req.editJustification || ''
       }))
     );
 
@@ -143,8 +148,10 @@ const App: React.FC = () => {
         body: JSON.stringify({
           action: "SYNC_DATABASE",
           data: {
-            ...currentData,
-            flattenedRequests // Enviamos a versão detalhada para a planilha
+            sectors: currentData.sectors,
+            employees: currentData.employees,
+            requests: currentData.requests,
+            flattenedRequests // Array detalhado para preenchimento de células na planilha
           }
         }),
       });
@@ -212,39 +219,117 @@ const App: React.FC = () => {
   };
 
   const submitRequest = () => {
-    const employee = employees.find(e => String(e.id) === String(selectedEmployee));
-    const sector = sectors.find(s => String(s.id) === String(employee?.sectorId || selectedSector));
-    
-    if (!employee && state.flowType === EmployeeType.REGISTRADO) return;
+    // 1. Determina o contexto: Nova Solicitação (fluxo normal) ou Edição (admin)
+    let targetEmployeeId = selectedEmployee;
+    let targetSectorId = selectedSector;
+    let targetFlowType = state.flowType;
 
+    if (editingRequestId) {
+      const originalReq = requests.find(r => r.id === editingRequestId);
+      if (originalReq) {
+        targetEmployeeId = originalReq.employeeId;
+        targetSectorId = originalReq.sectorId;
+        targetFlowType = originalReq.employeeType;
+      }
+    }
+
+    // 2. Busca os objetos completos para cálculo (Salário, Taxa, etc)
+    const employee = employees.find(e => String(e.id) === String(targetEmployeeId));
+    const sector = sectors.find(s => String(s.id) === String(employee?.sectorId || targetSectorId));
+    
+    // 3. Validação Básica
+    if (targetFlowType === EmployeeType.REGISTRADO && !employee) {
+      alert("Erro: Dados do funcionário não encontrados para recálculo.");
+      return;
+    }
+
+    // 4. Lógica de Cálculo
     let totalDiffHours = 0;
     let totalPayment = 0;
 
-    if (state.flowType === EmployeeType.REGISTRADO && employee) {
-      const hourlyBase = (employee.salary / employee.monthlyHours) * 1.25;
+    if (targetFlowType === EmployeeType.REGISTRADO && employee) {
+      // Cálculo REGISTRADO: Salário Hora + 25%
+      const hourlyBase = (employee.salary / employee.monthlyHours);
+      const overtimeRate = hourlyBase * 1.25;
+      
       modalRecords.forEach(r => {
-        const diff = r.isFolgaVendida 
-          ? calculateTimeDiff(r.realExit, r.realEntry)
-          : calculateTimeDiff(r.realEntry, r.punchEntry) + calculateTimeDiff(r.realExit, r.punchExit);
-        totalDiffHours += diff;
+        let dailyHours = 0;
+
+        if (r.isFolgaVendida) {
+          // FOLGA VENDIDA: Calcula o tempo total trabalhado (Saída Real - Entrada Real)
+          // Na folga vendida não há "Ponto", logo consideramos o período integral como extra.
+          if (r.realEntry && r.realExit) {
+             const start = timeToDecimal(r.realEntry);
+             const end = timeToDecimal(r.realExit);
+             let diff = end - start;
+             if (diff < 0) diff += 24; // Ajuste para virada de noite
+             dailyHours += diff;
+          }
+        } else {
+          // DIA NORMAL: (Saída real - saída ponto) + (entrada ponto - entrada real)
+          
+          // 1. Chegada Antecipada: Entrada Ponto - Entrada Real
+          if (r.realEntry && r.punchEntry) {
+            const real = timeToDecimal(r.realEntry);
+            const punch = timeToDecimal(r.punchEntry);
+            if (real < punch) {
+              dailyHours += (punch - real);
+            }
+          }
+
+          // 2. Saída Tardia: Saída Real - Saída Ponto
+          if (r.realExit && r.punchExit) {
+            const real = timeToDecimal(r.realExit);
+            const punch = timeToDecimal(r.punchExit);
+            if (real > punch) {
+              dailyHours += (real - punch);
+            }
+          }
+        }
+        
+        totalDiffHours += dailyHours;
       });
-      totalPayment = totalDiffHours * hourlyBase;
+      
+      totalPayment = totalDiffHours * overtimeRate;
+
     } else {
-      const dailyRate = (sector?.fixedRate || 0) + 12;
-      modalRecords.forEach(r => { if (r.realEntry && r.realExit) totalPayment += dailyRate; });
+      // Cálculo FIXO: (Hora Saída - Hora Entrada) * Valor Hora Setor + R$12,00 VT
+      const hourlyRate = sector?.fixedRate || 0; // Valor da hora cadastrada no setor
+      
+      modalRecords.forEach(r => { 
+        if (r.realEntry && r.realExit) {
+          const start = timeToDecimal(r.realEntry);
+          const end = timeToDecimal(r.realExit);
+          
+          let dailyHours = end - start;
+          if (dailyHours < 0) dailyHours += 24;
+          
+          // Se trabalhou no dia (tem horas), calcula valor + VT
+          if (dailyHours > 0) {
+            totalPayment += (dailyHours * hourlyRate) + 12;
+            totalDiffHours += dailyHours;
+          }
+        }
+      });
     }
 
+    // 5. Salvar ou Atualizar
     if (editingRequestId) {
       setRequests(requests.map(r => r.id === editingRequestId ? {
-        ...r, records: modalRecords, calculatedValue: totalPayment, editJustification
+        ...r, 
+        records: modalRecords, 
+        calculatedValue: totalPayment, 
+        totalTimeDecimal: totalDiffHours,
+        editJustification 
       } : r));
       setEditingRequestId(null);
+      setEditJustification('');
     } else {
       const newReq: TimeRequest = {
         id: Math.random().toString(36).substr(2, 9),
-        employeeId: employee?.id || 'fixo',
-        employeeName: employee?.name || selectedEmployee,
-        employeeType: state.flowType!,
+        employeeId: employee?.id || 'fixo-' + Date.now(),
+        employeeName: employee?.name || selectedEmployee || 'Colaborador Fixo',
+        employeeType: targetFlowType!,
         sectorId: sector?.id || '',
         sectorName: sector?.name || '',
         weekStarting: currentWeek,
@@ -262,34 +347,115 @@ const App: React.FC = () => {
 
   // --- UI Components ---
 
-  const RequestCard: React.FC<{ req: TimeRequest }> = ({ req }) => (
-    <div className="bg-white p-4 rounded-2xl border border-gray-100 shadow-sm hover:shadow-md transition mb-3 group">
-      <div className="flex justify-between items-start mb-2">
-        <span className={`px-2 py-0.5 rounded text-[9px] font-black uppercase ${req.employeeType === EmployeeType.REGISTRADO ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'}`}>
-          {req.employeeType}
-        </span>
-        <p className="text-sm font-black text-gray-900">{formatCurrency(req.calculatedValue)}</p>
-      </div>
-      <h4 className="text-sm font-bold text-gray-800 line-clamp-1">{req.employeeName}</h4>
-      <p className="text-[10px] text-gray-400 mb-3">{req.sectorName} • Sem: {new Date(req.weekStarting).toLocaleDateString('pt-BR')}</p>
-      
-      <div className="flex gap-1">
-        {req.status === RequestStatus.PENDENTE && (
-          <>
-            <button onClick={() => setRequests(requests.map(r => r.id === req.id ? {...r, status: RequestStatus.APROVADO} : r))} className="flex-1 bg-green-50 text-green-600 p-2 rounded-lg hover:bg-green-600 hover:text-white transition flex justify-center"><CheckCircle className="w-4 h-4" /></button>
-            <button onClick={() => setRequests(requests.map(r => r.id === req.id ? {...r, status: RequestStatus.REJEITADO} : r))} className="flex-1 bg-red-50 text-red-600 p-2 rounded-lg hover:bg-red-600 hover:text-white transition flex justify-center"><XCircle className="w-4 h-4" /></button>
-          </>
+  const RequestCard: React.FC<{ req: TimeRequest }> = ({ req }) => {
+    const [isExpanded, setIsExpanded] = useState(false);
+
+    // Função auxiliar para calcular horas do dia para exibição na tabela
+    const getDailyHours = (r: TimeRecord, type: EmployeeType) => {
+        let total = 0;
+        if (type === EmployeeType.FIXO) {
+            if (r.realEntry && r.realExit) {
+                let diff = timeToDecimal(r.realExit) - timeToDecimal(r.realEntry);
+                if (diff < 0) diff += 24;
+                total = diff;
+            }
+        } else {
+            // Registrado
+            if (r.isFolgaVendida) {
+                 if (r.realEntry && r.realExit) {
+                    let diff = timeToDecimal(r.realExit) - timeToDecimal(r.realEntry);
+                    if (diff < 0) diff += 24;
+                    total = diff;
+                 }
+            } else {
+                // Normal: Soma das pontas (extra)
+                 if (r.realEntry && r.punchEntry) {
+                    const diff = timeToDecimal(r.punchEntry) - timeToDecimal(r.realEntry);
+                    if(diff > 0) total += diff;
+                 }
+                 if (r.realExit && r.punchExit) {
+                    const diff = timeToDecimal(r.realExit) - timeToDecimal(r.punchExit);
+                    if(diff > 0) total += diff;
+                 }
+            }
+        }
+        return total > 0 ? formatDecimalHours(total) : '-';
+    };
+
+    return (
+      <div className="bg-white p-4 rounded-2xl border border-gray-100 shadow-sm hover:shadow-md transition mb-3 group">
+        <div className="flex justify-between items-start mb-2">
+          <span className={`px-2 py-0.5 rounded text-[9px] font-black uppercase ${req.employeeType === EmployeeType.REGISTRADO ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'}`}>
+            {req.employeeType}
+          </span>
+          <div className="text-right">
+            <p className="text-[10px] text-gray-500 font-bold mb-0.5">{formatDecimalHours(req.totalTimeDecimal)}</p>
+            <p className="text-sm font-black text-gray-900">{formatCurrency(req.calculatedValue)}</p>
+          </div>
+        </div>
+        <h4 className="text-sm font-bold text-gray-800 line-clamp-1">{req.employeeName}</h4>
+        <p className="text-[10px] text-gray-400 mb-3">{req.sectorName} • Sem: {new Date(req.weekStarting).toLocaleDateString('pt-BR')}</p>
+        
+        {/* Expanded Details */}
+        {isExpanded && (
+            <div className="mt-2 mb-4 bg-gray-50 rounded-xl p-2 overflow-x-auto">
+                <table className="w-full text-[10px] text-left">
+                    <thead>
+                        <tr className="text-gray-400 border-b border-gray-200">
+                            <th className="pb-1 font-semibold">Dia</th>
+                            <th className="pb-1 font-semibold">Ent. Real</th>
+                            <th className="pb-1 font-semibold text-gray-300">Ent. Ponto</th>
+                            <th className="pb-1 font-semibold text-gray-300">Sai. Ponto</th>
+                            <th className="pb-1 font-semibold">Sai. Real</th>
+                            <th className="pb-1 font-semibold text-right">Calc.</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {req.records.map((r, idx) => (
+                            <tr key={idx} className={`border-b border-gray-100 last:border-0 ${r.isFolgaVendida ? 'bg-blue-50/50' : ''}`}>
+                                <td className="py-1.5 font-bold text-gray-600">
+                                    {new Date(r.date + 'T00:00:00').toLocaleDateString('pt-BR', { weekday: 'short' }).slice(0,3)}
+                                    {r.isFolgaVendida && <span className="block text-[8px] text-blue-600 font-black">FOLGA</span>}
+                                </td>
+                                <td className="py-1.5 text-gray-700">{r.realEntry || '-'}</td>
+                                <td className="py-1.5 text-gray-400">{r.punchEntry || '-'}</td>
+                                <td className="py-1.5 text-gray-400">{r.punchExit || '-'}</td>
+                                <td className="py-1.5 text-gray-700">{r.realExit || '-'}</td>
+                                <td className="py-1.5 text-right font-bold text-gray-800">{getDailyHours(r, req.employeeType)}</td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            </div>
         )}
-        <button onClick={() => {
-          setEditingRequestId(req.id);
-          setModalRecords(JSON.parse(JSON.stringify(req.records)));
-          setCurrentWeek(req.weekStarting);
-          setShowFormModal(true);
-        }} className="flex-1 bg-gray-50 text-gray-400 p-2 rounded-lg hover:bg-gray-200 transition flex justify-center"><Edit2 className="w-4 h-4" /></button>
-        <button onClick={() => setRequests(requests.filter(r => r.id !== req.id))} className="bg-gray-50 text-gray-300 p-2 rounded-lg hover:bg-red-50 hover:text-red-400 transition flex justify-center"><XCircle className="w-4 h-4" /></button>
+
+        <div className="flex gap-1 items-center">
+            <button 
+                onClick={() => setIsExpanded(!isExpanded)} 
+                className="bg-gray-50 text-gray-400 p-2 rounded-lg hover:bg-gray-100 transition mr-1"
+                title="Ver Detalhes"
+            >
+                {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+            </button>
+
+          {req.status === RequestStatus.PENDENTE && (
+            <>
+              <button onClick={() => setRequests(requests.map(r => r.id === req.id ? {...r, status: RequestStatus.APROVADO} : r))} className="flex-1 bg-green-50 text-green-600 p-2 rounded-lg hover:bg-green-600 hover:text-white transition flex justify-center"><CheckCircle className="w-4 h-4" /></button>
+              <button onClick={() => setRequests(requests.map(r => r.id === req.id ? {...r, status: RequestStatus.REJEITADO} : r))} className="flex-1 bg-red-50 text-red-600 p-2 rounded-lg hover:bg-red-600 hover:text-white transition flex justify-center"><XCircle className="w-4 h-4" /></button>
+            </>
+          )}
+          <button onClick={() => {
+            setEditingRequestId(req.id);
+            setModalRecords(JSON.parse(JSON.stringify(req.records)));
+            setCurrentWeek(req.weekStarting);
+            setEditJustification(req.editJustification || '');
+            setShowFormModal(true);
+          }} className="flex-1 bg-gray-50 text-gray-400 p-2 rounded-lg hover:bg-gray-200 transition flex justify-center"><Edit2 className="w-4 h-4" /></button>
+          <button onClick={() => setRequests(requests.filter(r => r.id !== req.id))} className="bg-gray-50 text-gray-300 p-2 rounded-lg hover:bg-red-50 hover:text-red-400 transition flex justify-center"><XCircle className="w-4 h-4" /></button>
+        </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   const renderAdminRequestsSubView = () => (
     <div className="h-full flex flex-col gap-6">
@@ -470,10 +636,10 @@ const App: React.FC = () => {
                 <h2 className="text-2xl font-bold">Setores</h2>
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4 bg-gray-50 p-6 rounded-2xl">
                   <input type="text" placeholder="Nome" className="p-3 border rounded-xl bg-white text-black" value={newSec.name} onChange={(e) => setNewSec({ ...newSec, name: e.target.value })} />
-                  <input type="number" placeholder="Diária Extra" className="p-3 border rounded-xl bg-white text-black" value={newSec.fixedRate || ''} onChange={(e) => setNewSec({ ...newSec, fixedRate: parseFloat(e.target.value) })} />
+                  <input type="number" placeholder="Valor Hora" className="p-3 border rounded-xl bg-white text-black" value={newSec.fixedRate || ''} onChange={(e) => setNewSec({ ...newSec, fixedRate: parseFloat(e.target.value) })} />
                   <button onClick={() => { if(newSec.name) { setSectors([...sectors, {...newSec, id: Date.now().toString()}]); setNewSec({name: '', fixedRate: 0}); } }} className="bg-blue-600 text-white font-bold rounded-xl">Adicionar</button>
                 </div>
-                <table className="w-full text-left"><thead><tr className="text-gray-400 text-xs border-b"><th className="py-4">Setor</th><th className="py-4">Diária</th><th className="py-4 text-right">Ação</th></tr></thead><tbody>{sectors.map(s => (<tr key={s.id} className="border-b"><td className="py-4 font-semibold">{s.name}</td><td className="py-4">{formatCurrency(s.fixedRate)}</td><td className="py-4 text-right"><button onClick={() => setSectors(sectors.filter(sec => sec.id !== s.id))} className="text-red-500"><XCircle className="w-5 h-4" /></button></td></tr>))}</tbody></table>
+                <table className="w-full text-left"><thead><tr className="text-gray-400 text-xs border-b"><th className="py-4">Setor</th><th className="py-4">Valor Hora</th><th className="py-4 text-right">Ação</th></tr></thead><tbody>{sectors.map(s => (<tr key={s.id} className="border-b"><td className="py-4 font-semibold">{s.name}</td><td className="py-4">{formatCurrency(s.fixedRate)}</td><td className="py-4 text-right"><button onClick={() => setSectors(sectors.filter(sec => sec.id !== s.id))} className="text-red-500"><XCircle className="w-5 h-4" /></button></td></tr>))}</tbody></table>
               </div>
             )}
 
@@ -487,7 +653,7 @@ const App: React.FC = () => {
                   <input type="number" placeholder="Horas" className="p-3 border rounded-xl bg-white text-black" value={newEmpData.monthlyHours || ''} onChange={(e) => setNewEmpData({ ...newEmpData, monthlyHours: parseFloat(e.target.value) })} />
                   <button onClick={() => { if(newEmpData.name) { setEmployees([...employees, {...newEmpData, id: Date.now().toString()}]); setNewEmpData({name: '', sectorId: '', salary: 0, monthlyHours: 220, type: EmployeeType.REGISTRADO}); } }} className="bg-blue-600 text-white font-bold rounded-xl">Add</button>
                 </div>
-                <table className="w-full text-left"><thead><tr className="border-b text-xs text-gray-400"><th className="py-4">Nome</th><th className="py-4">Setor</th><th className="py-4 text-right">Ação</th></tr></thead><tbody>{employees.map(e => (<tr key={e.id} className="border-b"><td className="py-4">{e.name}</td><td className="py-4">{sectors.find(s => s.id === e.sectorId)?.name}</td><td className="py-4 text-right"><button onClick={() => setEmployees(employees.filter(emp => emp.id !== e.id))} className="text-red-400"><XCircle className="w-4 h-4" /></button></td></tr>))}</tbody></table>
+                <table className="w-full text-left"><thead><tr className="border-b text-xs text-gray-400"><th className="py-4">Nome</th><th className="py-4">Setor</th><th className="py-4">Valor Hora (+25%)</th><th className="py-4 text-right">Ação</th></tr></thead><tbody>{employees.map(e => (<tr key={e.id} className="border-b"><td className="py-4">{e.name}</td><td className="py-4">{sectors.find(s => s.id === e.sectorId)?.name}</td><td className="py-4">{formatCurrency((e.salary / (e.monthlyHours || 1)) * 1.25)}</td><td className="py-4 text-right"><button onClick={() => setEmployees(employees.filter(emp => emp.id !== e.id))} className="text-red-400"><XCircle className="w-4 h-4" /></button></td></tr>))}</tbody></table>
               </div>
             )}
 
@@ -525,26 +691,35 @@ const App: React.FC = () => {
               <div className="flex items-center gap-4"><span className="text-sm font-medium text-gray-500">Semana de:</span><input type="date" className="p-2 border rounded-lg bg-white text-black" value={currentWeek} onChange={(e) => !editingRequestId && setCurrentWeek(e.target.value)} disabled={!!editingRequestId} /></div>
             </div>
             <div className="space-y-4">
-              {modalRecords.map((r, idx) => (
-                <div key={idx} className="bg-gray-50 p-6 rounded-2xl border border-gray-100 shadow-sm space-y-4">
-                  <div className="flex justify-between items-center border-b pb-2">
-                    <span className="font-bold text-gray-700 capitalize">{new Date(r.date + 'T00:00:00').toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: 'short' })}</span>
-                    {(state.flowType === EmployeeType.REGISTRADO || (editingRequestId && requests.find(x => x.id === editingRequestId)?.employeeType === EmployeeType.REGISTRADO)) && (
-                      <button onClick={() => { const n = [...modalRecords]; n[idx].isFolgaVendida = !n[idx].isFolgaVendida; setModalRecords(n); }} className={`px-4 py-2 rounded-xl text-xs font-bold transition-all border-2 ${r.isFolgaVendida ? 'bg-blue-600 border-blue-600 text-white shadow-md' : 'bg-white border-gray-200 text-gray-500 hover:border-blue-400'}`}>Folga Vendida</button>
-                    )}
+              {modalRecords.map((r, idx) => {
+                // Lógica de contexto: Verifica se é edição e qual o tipo da requisição original
+                const activeRequestType = editingRequestId 
+                  ? requests.find(r => r.id === editingRequestId)?.employeeType 
+                  : state.flowType;
+                  
+                const isRegistradoFlow = activeRequestType === EmployeeType.REGISTRADO;
+
+                return (
+                  <div key={idx} className="bg-gray-50 p-6 rounded-2xl border border-gray-100 shadow-sm space-y-4">
+                    <div className="flex justify-between items-center border-b pb-2">
+                      <span className="font-bold text-gray-700 capitalize">{new Date(r.date + 'T00:00:00').toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: 'short' })}</span>
+                      {isRegistradoFlow && (
+                        <button onClick={() => { const n = [...modalRecords]; n[idx].isFolgaVendida = !n[idx].isFolgaVendida; setModalRecords(n); }} className={`px-4 py-2 rounded-xl text-xs font-bold transition-all border-2 ${r.isFolgaVendida ? 'bg-blue-600 border-blue-600 text-white shadow-md' : 'bg-white border-gray-200 text-gray-500 hover:border-blue-400'}`}>Folga Vendida</button>
+                      )}
+                    </div>
+                    <div className={`grid gap-4 ${isRegistradoFlow && !r.isFolgaVendida ? 'grid-cols-2 md:grid-cols-4' : 'grid-cols-2'}`}>
+                      <div><label className="block text-[10px] uppercase font-bold text-gray-400 mb-1">Entrada Real</label><input type="time" className="w-full p-2 border rounded-lg bg-white text-black" value={r.realEntry} onChange={(e) => { const n = [...modalRecords]; n[idx].realEntry = e.target.value; setModalRecords(n); }} /></div>
+                      {isRegistradoFlow && !r.isFolgaVendida && (
+                        <>
+                          <div><label className="block text-[10px] uppercase font-bold text-gray-400 mb-1">Entrada Ponto</label><input type="time" className="w-full p-2 border rounded-lg bg-white text-black" value={r.punchEntry} onChange={(e) => { const n = [...modalRecords]; n[idx].punchEntry = e.target.value; setModalRecords(n); }} /></div>
+                          <div><label className="block text-[10px] uppercase font-bold text-gray-400 mb-1">Saída Ponto</label><input type="time" className="w-full p-2 border rounded-lg bg-white text-black" value={r.punchExit} onChange={(e) => { const n = [...modalRecords]; n[idx].punchExit = e.target.value; setModalRecords(n); }} /></div>
+                        </>
+                      )}
+                      <div><label className="block text-[10px] uppercase font-bold text-gray-400 mb-1">Saída Real</label><input type="time" className="w-full p-2 border rounded-lg bg-white text-black" value={r.realExit} onChange={(e) => { const n = [...modalRecords]; n[idx].realExit = e.target.value; setModalRecords(n); }} /></div>
+                    </div>
                   </div>
-                  <div className={`grid gap-4 ${state.flowType === EmployeeType.REGISTRADO && !r.isFolgaVendida ? 'grid-cols-2 md:grid-cols-4' : 'grid-cols-2'}`}>
-                    <div><label className="block text-[10px] uppercase font-bold text-gray-400 mb-1">Entrada Real</label><input type="time" className="w-full p-2 border rounded-lg bg-white text-black" value={r.realEntry} onChange={(e) => { const n = [...modalRecords]; n[idx].realEntry = e.target.value; setModalRecords(n); }} /></div>
-                    {state.flowType === EmployeeType.REGISTRADO && !r.isFolgaVendida && (
-                      <>
-                        <div><label className="block text-[10px] uppercase font-bold text-gray-400 mb-1">Entrada Ponto</label><input type="time" className="w-full p-2 border rounded-lg bg-white text-black" value={r.punchEntry} onChange={(e) => { const n = [...modalRecords]; n[idx].punchEntry = e.target.value; setModalRecords(n); }} /></div>
-                        <div><label className="block text-[10px] uppercase font-bold text-gray-400 mb-1">Saída Ponto</label><input type="time" className="w-full p-2 border rounded-lg bg-white text-black" value={r.punchExit} onChange={(e) => { const n = [...modalRecords]; n[idx].punchExit = e.target.value; setModalRecords(n); }} /></div>
-                      </>
-                    )}
-                    <div><label className="block text-[10px] uppercase font-bold text-gray-400 mb-1">Saída Real</label><input type="time" className="w-full p-2 border rounded-lg bg-white text-black" value={r.realExit} onChange={(e) => { const n = [...modalRecords]; n[idx].realExit = e.target.value; setModalRecords(n); }} /></div>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
             {editingRequestId && <div className="mt-8"><label className="block text-sm font-semibold mb-2">Justificativa</label><textarea className="w-full p-4 border rounded-xl bg-white text-black" rows={2} value={editJustification} onChange={(e) => setEditJustification(e.target.value)} /></div>}
             <div className="mt-10 flex justify-end gap-4"><button onClick={() => { setShowFormModal(false); setEditingRequestId(null); }} className="px-8 py-3 bg-gray-100 text-gray-700 font-bold rounded-xl">Cancelar</button><button onClick={submitRequest} className="px-8 py-3 bg-blue-600 text-white font-bold rounded-xl shadow-lg">Confirmar e Enviar</button></div>
